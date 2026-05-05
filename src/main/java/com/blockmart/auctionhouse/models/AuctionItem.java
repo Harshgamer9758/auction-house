@@ -1,41 +1,45 @@
 package com.blockmart.auctionhouse.models;
 
-import java.time.LocalDateTime;
+import org.bukkit.inventory.ItemStack;
+
 import java.util.UUID;
 
 public class AuctionItem {
-    private final long id;
-    private final UUID sellerUuid;
-    private final String itemData; // Base64 encoded ItemStack
-    private final double startPrice;
-    private double currentBid;
-    private UUID highestBidderUuid;
-    private final LocalDateTime listTime;
-    private final LocalDateTime endTime;
-    private String status; // LISTED, ENDED, CANCELLED
 
-    public AuctionItem(long id, UUID sellerUuid, String itemData, double startPrice, double currentBid, UUID highestBidderUuid, LocalDateTime listTime, LocalDateTime endTime, String status) {
+    private int id;
+    private UUID sellerUUID;
+    private ItemStack itemStack;
+    private double startPrice;
+    private double currentBid;
+    private UUID highestBidderUUID;
+    private long endTime;
+    private boolean active;
+
+    public AuctionItem(int id, UUID sellerUUID, ItemStack itemStack, double startPrice, double currentBid, UUID highestBidderUUID, long endTime, boolean active) {
         this.id = id;
-        this.sellerUuid = sellerUuid;
-        this.itemData = itemData;
+        this.sellerUUID = sellerUUID;
+        this.itemStack = itemStack;
         this.startPrice = startPrice;
         this.currentBid = currentBid;
-        this.highestBidderUuid = highestBidderUuid;
-        this.listTime = listTime;
+        this.highestBidderUUID = highestBidderUUID;
         this.endTime = endTime;
-        this.status = status;
+        this.active = active;
     }
 
-    public long getId() {
+    public int getId() {
         return id;
     }
 
-    public UUID getSellerUuid() {
-        return sellerUuid;
+    public void setId(int id) {
+        this.id = id;
     }
 
-    public String getItemData() {
-        return itemData;
+    public UUID getSellerUUID() {
+        return sellerUUID;
+    }
+
+    public ItemStack getItemStack() {
+        return itemStack;
     }
 
     public double getStartPrice() {
@@ -50,27 +54,27 @@ public class AuctionItem {
         this.currentBid = currentBid;
     }
 
-    public UUID getHighestBidderUuid() {
-        return highestBidderUuid;
+    public UUID getHighestBidderUUID() {
+        return highestBidderUUID;
     }
 
-    public void setHighestBidderUuid(UUID highestBidderUuid) {
-        this.highestBidderUuid = highestBidderUuid;
+    public void setHighestBidderUUID(UUID highestBidderUUID) {
+        this.highestBidderUUID = highestBidderUUID;
     }
 
-    public LocalDateTime getListTime() {
-        return listTime;
-    }
-
-    public LocalDateTime getEndTime() {
+    public long getEndTime() {
         return endTime;
     }
 
-    public String getStatus() {
-        return status;
+    public void setEndTime(long endTime) {
+        this.endTime = endTime;
     }
 
-    public void setStatus(String status) {
-        this.status = status;
+    public boolean isActive() {
+        return active;
+    }
+
+    public void setActive(boolean active) {
+        this.active = active;
     }
 }
