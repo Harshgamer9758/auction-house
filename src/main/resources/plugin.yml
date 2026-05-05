@@ -1,0 +1,20 @@
+main: com.blockmart.auctionhouse.AuctionHouse
+name: AuctionHouse
+version: '1.0.0'
+api-version: '1.20'
+author: harsh
+description: A robust auction house plugin with escrow, NBT item filtering, and bidding functionalities.
+softdepend: [Vault]
+commands:
+  ah: 
+    description: Main Auction House command.
+    usage: /<command> [list|sell|bid|collect]
+    permission: auctionhouse.use
+    permission-message: You don't have permission to use the Auction House.
+permissions:
+  auctionhouse.use:
+    description: Allows players to use the Auction House.
+    default: true
+  auctionhouse.admin:
+    description: Allows administrators to manage the Auction House.
+    default: op
