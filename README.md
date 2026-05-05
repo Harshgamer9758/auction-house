@@ -1,6 +1,6 @@
 # AuctionHouse
 
-A robust auction house plugin with escrow, NBT item filtering, and bidding functionalities.
+A robust auction house plugin with escrow and bidding functionalities.
 
 ## Build
 
