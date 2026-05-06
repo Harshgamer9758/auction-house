@@ -2,6 +2,7 @@ package com.blockmart.auctionhouse.listeners;
 
 import com.blockmart.auctionhouse.AuctionHousePlugin;
 import com.blockmart.auctionhouse.managers.AuctionManager;
+import org.bukkit.ChatColor;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -18,9 +19,15 @@ public class AuctionListener implements Listener {
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        plugin.getEscrowManager().getPlayerEscrowItems(event.getPlayer().getUniqueId()).thenAccept(items -> {
+        // Check for items/money in escrow upon login
+        auctionManager.collectItems(event.getPlayer()).thenAccept(items -> {
             if (!items.isEmpty()) {
-                event.getPlayer().sendMessage("§eYou have items waiting in the auction escrow! Use /auction collect to retrieve them.");
+                event.getPlayer().sendMessage(ChatColor.YELLOW + "You have items waiting in your auction escrow! Use /auction collect to retrieve them.");
+            }
+        });
+        auctionManager.getPlayerEscrowBalance(event.getPlayer()).thenAccept(balance -> {
+            if (balance > 0) {
+                event.getPlayer().sendMessage(ChatColor.YELLOW + "You have an escrow balance of " + plugin.getDatabaseManager().getEconomy().format(balance) + "! Use /auction collect to withdraw.");
             }
         });
     }
