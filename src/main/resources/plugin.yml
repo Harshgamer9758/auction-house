@@ -3,20 +3,17 @@ name: AuctionHouse
 version: '1.0.0'
 api-version: '1.20'
 author: harsh
-description: An advanced auction house plugin with escrow and bidding features.
-dependencies:
-  server:
-    - Vault
+description: A feature-rich auction house with escrow and bidding functionalities.
 commands:
   auction:
-    description: Main command for the Auction House.
-    usage: /<command> [list|sell|bid|collect]
-    permission: auctionhouse.player
-    permission-message: You do not have permission to use the Auction House.
+    description: Main auction house command.
+    usage: /auction [list|sell|bid|collect]
+    permission: auctionhouse.use
+    permission-message: You do not have permission to use the auction house.
 permissions:
-  auctionhouse.player:
-    description: Allows players to use the Auction House.
+  auctionhouse.use:
+    description: Allows use of auction house commands.
     default: true
   auctionhouse.admin:
-    description: Allows administrators to manage the Auction House.
+    description: Allows administrative auction house commands.
     default: op
