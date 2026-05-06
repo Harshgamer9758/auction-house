@@ -1,18 +1,22 @@
+main: com.blockmart.auctionhouse.AuctionHousePlugin
 name: AuctionHouse
 version: '1.0.0'
-main: com.blockmart.auctionhouse.AuctionHouse
-api-version: '1.16'
+api-version: '1.20'
 author: harsh
+description: An advanced auction house plugin with escrow and bidding features.
+dependencies:
+  server:
+    - Vault
 commands:
-  ah: 
-    description: Main Auction House command.
-    usage: /<command>
-    aliases: [auction]
-    permission: auctionhouse.use
+  auction:
+    description: Main command for the Auction House.
+    usage: /<command> [list|sell|bid|collect]
+    permission: auctionhouse.player
+    permission-message: You do not have permission to use the Auction House.
 permissions:
-  auctionhouse.use:
-    description: Allows access to the auction house.
+  auctionhouse.player:
+    description: Allows players to use the Auction House.
     default: true
   auctionhouse.admin:
-    description: Allows admin commands for auction house.
+    description: Allows administrators to manage the Auction House.
     default: op
