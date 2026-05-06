@@ -1,47 +1,41 @@
 package com.blockmart.auctionhouse.utils;
 
-import org.bukkit.NamespacedKey;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.ItemMeta;
-import org.bukkit.persistence.PersistentDataContainer;
-import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.util.io.BukkitObjectInputStream;
+import org.bukkit.util.io.BukkitObjectOutputStream;
+import org.yaml.snakeyaml.external.biz.base64Coder.Base64Coder;
 
-import java.util.Set;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 
-/**
- * Utility for filtering items based on NBT data.
- */
 public class NBTUtils {
 
-    /**
-     * Checks if an ItemStack contains any NBT tags from a given set of blacklisted keys.
-     * This helps prevent players from auctioning items with problematic or plugin-specific NBT.
-     *
-     * @param itemStack The item to check.
-     * @param blacklistedKeys A set of NBT keys that are not allowed.
-     * @return true if the itemStack contains any blacklisted NBT key, false otherwise.
-     */
-    public static boolean containsBlacklistedNBT(ItemStack itemStack, Set<String> blacklistedKeys) {
-        if (itemStack == null || !itemStack.hasItemMeta()) {
-            return false;
-        }
-        ItemMeta meta = itemStack.getItemMeta();
-        PersistentDataContainer container = meta.getPersistentDataContainer();
+    public static String itemStackToBase64(ItemStack item) throws IllegalStateException {
+        try {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            BukkitObjectOutputStream dataOutput = new BukkitObjectOutputStream(outputStream);
 
-        for (String key : blacklistedKeys) {
-            // Check for existence without specific type, as type might vary or be unknown for blacklisted tags.
-            // Using ItemNBTUtil here would require knowing the exact type, which is not ideal for general blacklisting.
-            // Instead, we check the underlying keys.
-            if (container.has(new NamespacedKey(ItemNBTUtil.class.getPackageName().replace("utils", ""), key), PersistentDataType.STRING)) { // Example, dynamically adjust package for NamespacedKey
-                return true;
-            }
+            dataOutput.writeObject(item);
+
+            dataOutput.close();
+            return Base64Coder.encodeLines(outputStream.toByteArray());
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to save item stack to Base64.", e);
         }
-        // More generic check for keys from any namespace (might be too broad)
-        for (NamespacedKey key : container.getKeys()) {
-             if (blacklistedKeys.contains(key.getKey())) {
-                 return true;
-             }
+    }
+
+    public static ItemStack base64ToItemStack(String data) throws IOException {
+        try {
+            ByteArrayInputStream inputStream = new ByteArrayInputStream(Base64Coder.decodeLines(data));
+            BukkitObjectInputStream dataInput = new BukkitObjectInputStream(inputStream);
+            
+            ItemStack itemStack = (ItemStack) dataInput.readObject();
+
+            dataInput.close();
+            return itemStack;
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Unable to decode class type.", e);
         }
-        return false;
     }
 }
