@@ -1,28 +1,27 @@
 package com.blockmart.auctionhouse.listeners;
 
-import com.blockmart.auctionhouse.AuctionHouse;
+import com.blockmart.auctionhouse.AuctionHousePlugin;
 import com.blockmart.auctionhouse.managers.AuctionManager;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
-import org.bukkit.event.inventory.InventoryClickEvent;
-import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.event.player.PlayerJoinEvent;
 
 public class AuctionListener implements Listener {
 
-    private final AuctionHouse plugin;
+    private final AuctionHousePlugin plugin;
     private final AuctionManager auctionManager;
 
-    public AuctionListener(AuctionHouse plugin) {
+    public AuctionListener(AuctionHousePlugin plugin, AuctionManager auctionManager) {
         this.plugin = plugin;
-        this.auctionManager = plugin.getAuctionManager();
+        this.auctionManager = auctionManager;
     }
 
     @EventHandler
-    public void onInventoryClick(InventoryClickEvent event) {
-        InventoryHolder holder = event.getInventory().getHolder();
-        if (holder instanceof AuctionManager.AuctionGUIHolder) {
-            event.setCancelled(true);
-            auctionManager.handleGUIClick(event);
-        }
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        plugin.getEscrowManager().getPlayerEscrowItems(event.getPlayer().getUniqueId()).thenAccept(items -> {
+            if (!items.isEmpty()) {
+                event.getPlayer().sendMessage("§eYou have items waiting in the auction escrow! Use /auction collect to retrieve them.");
+            }
+        });
     }
 }
