@@ -1,328 +1,316 @@
 package com.blockmart.auctionhouse.managers;
 
-import com.blockmart.auctionhouse.AuctionHousePlugin;
+import com.blockmart.auctionhouse.AuctionHouse;
 import com.blockmart.auctionhouse.models.AuctionItem;
+import com.blockmart.auctionhouse.utils.ItemSerializer;
+import com.blockmart.auctionhouse.utils.NBTUtils;
 import net.milkbowl.vault.economy.Economy;
 import org.bukkit.Bukkit;
-import org.bukkit.ChatColor;
-import org.bukkit.Material;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.PlayerInventory;
-import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.scheduler.BukkitRunnable;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 public class AuctionManager {
 
-    private final AuctionHousePlugin plugin;
+    private final AuctionHouse plugin;
     private final DatabaseManager databaseManager;
-    private Economy economy;
+    private final Economy economy;
+    private final Map<UUID, AuctionItem> activeAuctions;
+    private final long AUCTION_DURATION_SECONDS = 24 * 60 * 60; // 24 hours
 
-    public AuctionManager(AuctionHousePlugin plugin, DatabaseManager databaseManager) {
+    public AuctionManager(AuctionHouse plugin, DatabaseManager databaseManager, Economy economy) {
         this.plugin = plugin;
         this.databaseManager = databaseManager;
-        if (!setupEconomy()) {
-            plugin.getLogger().severe("Vault not found or no economy provider! AuctionHouse will not function.");
-            plugin.getServer().getPluginManager().disablePlugin(plugin);
-        }
+        this.economy = economy;
+        this.activeAuctions = new ConcurrentHashMap<>();
     }
 
-    private boolean setupEconomy() {
-        if (plugin.getServer().getPluginManager().getPlugin("Vault") == null) {
-            return false;
-        }
-        RegisteredServiceProvider<Economy> rsp = plugin.getServer().getServicesManager().getRegistration(Economy.class);
-        if (rsp == null) {
-            return false;
-        }
-        economy = rsp.getProvider();
-        return economy != null;
-    }
-
-    public CompletableFuture<Void> listItemForAuction(Player player, ItemStack item, double price, long durationMinutes) {
-        return CompletableFuture.supplyAsync(() -> {
-            if (item == null || item.getType() == Material.AIR) {
-                player.sendMessage(ChatColor.RED + "You must hold an item to sell it at auction.");
-                return false;
-            }
-            if (price <= 0) {
-                player.sendMessage(ChatColor.RED + "Price must be greater than zero.");
-                return false;
-            }
-            if (durationMinutes <= 0) {
-                player.sendMessage(ChatColor.RED + "Auction duration must be greater than zero.");
-                return false;
-            }
-
-            PlayerInventory inventory = player.getInventory();
-            if (!inventory.containsAtLeast(item, item.getAmount())) {
-                player.sendMessage(ChatColor.RED + "You don't have this item in your inventory.");
-                return false;
-            }
-
-            long startTime = System.currentTimeMillis();
-            long endTime = startTime + TimeUnit.MINUTES.toMillis(durationMinutes);
-
-            AuctionItem auctionItem = new AuctionItem(
-                    0, // ID will be set by DB
-                    player.getName(),
-                    player.getUniqueId(),
-                    item.clone(), // Clone to prevent modifications after listing
-                    price,
-                    price,
-                    null,
-                    null,
-                    startTime,
-                    endTime,
-                    AuctionItem.AuctionStatus.LISTED
-            );
-
-            // Remove item from player's inventory and put into escrow
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                inventory.removeItem(item);
-                player.sendMessage(ChatColor.YELLOW + "You have listed " + item.getAmount() + "x " + item.getType().name() + " for auction.");
-            });
-            return auctionItem;
-        }).thenCompose(obj -> {
-            if (obj instanceof AuctionItem) {
-                AuctionItem auctionItem = (AuctionItem) obj;
-                return databaseManager.saveAuctionItem(auctionItem).thenApply(v -> true);
-            } else {
-                return CompletableFuture.completedFuture(false);
-            }
-        }).thenAccept(success -> {
-            if (!success) {
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                     player.sendMessage(ChatColor.RED + "Failed to list item for auction. Please try again.");
-                     player.getInventory().addItem(item); // Return item if DB fails
-                });
-            }
-        }).exceptionally(e -> {
-            plugin.getLogger().log(Level.SEVERE, "Error listing item for auction: " + e.getMessage());
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                player.sendMessage(ChatColor.RED + "An internal error occurred while listing your item.");
-                player.getInventory().addItem(item); // Return item if exception occurs
-            });
-            return null;
-        });
-    }
-
-
-    public CompletableFuture<List<AuctionItem>> getActiveAuctions() {
-        return databaseManager.getListedAuctions();
-    }
-
-    public void closeExpiredAuctions() {
-        databaseManager.getExpiredAuctions().thenAccept(expiredAuctions -> {
-            for (AuctionItem auction : expiredAuctions) {
-                if (auction.getCurrentBid() > auction.getStartingPrice() && auction.getHighestBidderUuid() != null) {
-                    // Item sold
-                    UUID winnerUuid = auction.getHighestBidderUuid();
-                    String winnerName = auction.getHighestBidderName();
-                    double finalPrice = auction.getCurrentBid();
-                    UUID sellerUuid = auction.getSellerUuid();
-                    String sellerName = auction.getSellerName();
-                    ItemStack itemSold = auction.getItemStack();
-
-                    databaseManager.depositEscrowItem(winnerUuid.toString(), itemSold).thenAccept(v -> {
-                        plugin.getLogger().info("Auction " + auction.getId() + ": item for " + winnerName + " escrowed.");
-                        databaseManager.withdrawEscrowMoney(winnerUuid.toString()).thenAccept(moneyCollected -> {
-                            economy.depositPlayer(Bukkit.getOfflinePlayer(sellerUuid), finalPrice);
-                            economy.depositPlayer(Bukkit.getOfflinePlayer(winnerUuid), moneyCollected - finalPrice); // Return excess bid
-                            databaseManager.updateAuctionStatus(auction.getId(), AuctionItem.AuctionStatus.SOLD);
-
-                            Bukkit.getScheduler().runTask(plugin, () -> {
-                                Player winnerPlayer = Bukkit.getPlayer(winnerUuid);
-                                if (winnerPlayer != null) {
-                                    winnerPlayer.sendMessage(ChatColor.GREEN + "You won auction #" + auction.getId() + " for " + economy.format(finalPrice) + "! Collect your item with /auction collect.");
-                                    if (moneyCollected - finalPrice > 0) {
-                                        winnerPlayer.sendMessage(ChatColor.GREEN + "" + economy.format(moneyCollected - finalPrice) + " has been returned to your balance.");
-                                    }
-                                }
-                                Player sellerPlayer = Bukkit.getPlayer(sellerUuid);
-                                if (sellerPlayer != null) {
-                                    sellerPlayer.sendMessage(ChatColor.GREEN + "Your item in auction #" + auction.getId() + " was sold to " + winnerName + " for " + economy.format(finalPrice) + "! Your money has been deposited.");
-                                }
-                            });
-                        }).exceptionally(ex -> {
-                            plugin.getLogger().log(Level.SEVERE, "Error processing money for auction " + auction.getId() + ": " + ex.getMessage());
-                            return null;
-                        });
-                    }).exceptionally(ex -> {
-                        plugin.getLogger().log(Level.SEVERE, "Error escrowing item for auction " + auction.getId() + ": " + ex.getMessage());
-                        return null;
-                    });
-                } else {
-                    // No bids or highest bid not met, item returns to seller
-                    databaseManager.depositEscrowItem(auction.getSellerUuid().toString(), auction.getItemStack()).thenAccept(v -> {
-                        plugin.getLogger().info("Auction " + auction.getId() + ": item for seller " + auction.getSellerName() + " escrowed (no sale).");
-                        // If there was a high bidder who paid, refund their money
-                        if (auction.getHighestBidderUuid() != null && auction.getCurrentBid() > auction.getStartingPrice()) {
-                            UUID highestBidder = auction.getHighestBidderUuid();
-                            double bidAmount = auction.getCurrentBid();
-                            economy.depositPlayer(Bukkit.getOfflinePlayer(highestBidder), bidAmount);
-                            Bukkit.getScheduler().runTask(plugin, () -> {
-                                Player bidderPlayer = Bukkit.getPlayer(highestBidder);
-                                if (bidderPlayer != null) {
-                                    bidderPlayer.sendMessage(ChatColor.RED + "Your bid of " + economy.format(bidAmount) + " for auction #" + auction.getId() + " was refunded as the item didn't sell.");
-                                }
-                            });
-                        }
-                        databaseManager.updateAuctionStatus(auction.getId(), AuctionItem.AuctionStatus.EXPIRED);
-
-                        Bukkit.getScheduler().runTask(plugin, () -> {
-                            Player sellerPlayer = Bukkit.getPlayer(auction.getSellerUuid());
-                            if (sellerPlayer != null) {
-                                sellerPlayer.sendMessage(ChatColor.YELLOW + "Your item in auction #" + auction.getId() + " did not sell and has been returned to your collection.");
-                            }
-                        });
-                    }).exceptionally(ex -> {
-                        plugin.getLogger().log(Level.SEVERE, "Error escrowing item for failed auction " + auction.getId() + ": " + ex.getMessage());
-                        return null;
-                    });
-                }
-            }
-        }).exceptionally(e -> {
-            plugin.getLogger().log(Level.SEVERE, "Error closing expired auctions: " + e.getMessage());
-            return null;
-        });
-    }
-
-    public CompletableFuture<Boolean> placeBid(Player player, int auctionId, double bidAmount) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                List<AuctionItem> auctions = databaseManager.getListedAuctions().join(); // Blocking to get current auctions
-                Optional<AuctionItem> optionalAuction = auctions.stream().filter(a -> a.getId() == auctionId).findFirst();
-
-                if (optionalAuction.isEmpty()) {
-                    player.sendMessage(ChatColor.RED + "Auction with ID " + auctionId + " not found or has ended.");
-                    return false;
-                }
-
-                AuctionItem auction = optionalAuction.get();
-
-                if (auction.getSellerUuid().equals(player.getUniqueId())) {
-                    player.sendMessage(ChatColor.RED + "You cannot bid on your own auction.");
-                    return false;
-                }
-
-                if (System.currentTimeMillis() > auction.getEndTime()) {
-                    player.sendMessage(ChatColor.RED + "This auction has already ended.");
-                    databaseManager.updateAuctionStatus(auction.getId(), AuctionItem.AuctionStatus.EXPIRED); // Ensure it's marked expired
-                    return false;
-                }
-
-                // Minimum bid increment logic
-                double minBid = auction.getCurrentBid() + plugin.getConfig().getDouble("auction.min-bid-increment", 1.0);
-                if (bidAmount < minBid) {
-                    player.sendMessage(ChatColor.RED + "Your bid must be at least " + economy.format(minBid) + ".");
-                    return false;
-                }
-
-                if (!economy.has(player, bidAmount)) {
-                    player.sendMessage(ChatColor.RED + "You do not have enough money to place this bid.");
-                    return false;
-                }
-
-                // Process previous highest bidder refund
-                if (auction.getHighestBidderUuid() != null) {
-                    UUID previousBidder = auction.getHighestBidderUuid();
-                    double refundedAmount = auction.getCurrentBid();
-                    if (!previousBidder.equals(player.getUniqueId())) { // Don't refund yourself if you're outbidding yourself
-                         economy.depositPlayer(Bukkit.getOfflinePlayer(previousBidder), refundedAmount);
-                         Player previousBidderOnline = Bukkit.getPlayer(previousBidder);
-                         if (previousBidderOnline != null) {
-                             previousBidderOnline.sendMessage(ChatColor.YELLOW + "You have been outbid on auction #" + auction.getId() + "! " + economy.format(refundedAmount) + " has been refunded to your account.");
-                         }
-                    }
-                }
-
-                // Take money from current bidder
-                economy.withdrawPlayer(player, bidAmount);
-
-                auction.setCurrentBid(bidAmount);
-                auction.setHighestBidderUuid(player.getUniqueId());
-                auction.setHighestBidderName(player.getName());
-
-                databaseManager.updateAuctionItem(auction);
-
-                player.sendMessage(ChatColor.GREEN + "You have successfully bid " + economy.format(bidAmount) + " on auction #" + auction.getId() + ".");
-                // Notify seller
-                Player seller = Bukkit.getPlayer(auction.getSellerUuid());
-                if (seller != null) {
-                    seller.sendMessage(ChatColor.YELLOW + player.getName() + ChatColor.LIGHT_PURPLE + " just bid " + economy.format(bidAmount) + " on your auction #" + auction.getId() + "!");
-                }
-                return true;
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "Error placing bid: " + e.getMessage());
-                player.sendMessage(ChatColor.RED + "An internal error occurred while placing your bid.");
-                return false;
-            }
-        });
-    }
-
-    public CompletableFuture<List<ItemStack>> collectItems(Player player) {
-        return databaseManager.withdrawEscrowItems(player.getUniqueId().toString()).thenApply(items -> {
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                if (items.isEmpty()) {
-                    player.sendMessage(ChatColor.YELLOW + "You have no items to collect from the auction house.");
-                    return;
-                }
-                for (ItemStack item : items) {
-                    if (player.getInventory().firstEmpty() == -1) {
-                        player.getWorld().dropItemNaturally(player.getLocation(), item);
-                        player.sendMessage(ChatColor.YELLOW + "Your inventory was full, some items were dropped at your feet.");
-                    } else {
-                        player.getInventory().addItem(item);
-                    }
-                }
-                player.sendMessage(ChatColor.GREEN + "You have collected your items from the auction house.");
-            });
-            return items;
-        });
-    }
-
-    public CompletableFuture<Void> depositMoney(Player player, double amount) {
+    public CompletableFuture<Void> loadActiveAuctions() {
         return CompletableFuture.runAsync(() -> {
-            if (amount <= 0) {
-                player.sendMessage(ChatColor.RED + "You must deposit a positive amount of money.");
-                return;
-            }
-            if (!economy.has(player, amount)) {
-                player.sendMessage(ChatColor.RED + "You do not have " + economy.format(amount) + " to deposit.");
-                return;
-            }
-            economy.withdrawPlayer(player, amount);
-            databaseManager.depositEscrowMoney(player.getUniqueId().toString(), amount);
-            player.sendMessage(ChatColor.GREEN + "You have deposited " + economy.format(amount) + " to your auction escrow.");
-        });
+            long currentTime = Instant.now().getEpochSecond();
+            String query = "SELECT id, seller_uuid, item_nbt, start_price, current_bid, current_bidder_uuid, end_time, status FROM auctions WHERE status = 'ACTIVE' OR status = 'PENDING_CLAIM_SELLER_ITEM' OR status = 'PENDING_CLAIM_BIDDER_ITEM';";
+            databaseManager.executeQuery(query, rs -> {
+                try {
+                    while (rs.next()) {
+                        UUID id = UUID.fromString(rs.getString("id"));
+                        UUID sellerId = UUID.fromString(rs.getString("seller_uuid"));
+                        ItemStack item = plugin.getNbtUtils().deserializeNBTItem(rs.getString("item_nbt"));
+                        double startPrice = rs.getDouble("start_price");
+                        double currentBid = rs.getDouble("current_bid");
+                        UUID currentBidderId = null;
+                        if (rs.getString("current_bidder_uuid") != null) {
+                            currentBidderId = UUID.fromString(rs.getString("current_bidder_uuid"));
+                        }
+                        long endTime = rs.getLong("end_time");
+                        AuctionItem.AuctionStatus status = AuctionItem.AuctionStatus.valueOf(rs.getString("status"));
+
+                        AuctionItem auctionItem = new AuctionItem(id, sellerId, item, startPrice, currentBid, currentBidderId, endTime, status);
+                        activeAuctions.put(id, auctionItem);
+                        if (auctionItem.getStatus() == AuctionItem.AuctionStatus.ACTIVE && auctionItem.getEndTime() <= currentTime) {
+                            // This auction should have expired async, but handle it if still active
+                            new BukkitRunnable() {
+                                @Override
+                                public void run() {
+                                    expireAuction(auctionItem.getId());
+                                }
+                            }.runTask(plugin);
+                        }
+                    }
+                    plugin.getLogger().info("Loaded " + activeAuctions.size() + " active auctions.");
+                } catch (SQLException e) {
+                    plugin.getLogger().severe("Failed to load auctions: " + e.getMessage());
+                }
+            });
+        }, plugin.getServer().getScheduler().asyncScheduler());
     }
 
-    public CompletableFuture<Double> withdrawMoney(Player player) {
-        return databaseManager.withdrawEscrowMoney(player.getUniqueId().toString()).thenApply(amount -> {
-            if (amount > 0) {
-                economy.depositPlayer(player, amount);
-                player.sendMessage(ChatColor.GREEN + "You have withdrawn " + economy.format(amount) + " from your auction escrow.");
+    public void createAuction(Player player, ItemStack item, double price) {
+        UUID auctionId = UUID.randomUUID();
+        long endTime = Instant.now().getEpochSecond() + AUCTION_DURATION_SECONDS;
+        String itemNBT = plugin.getNbtUtils().serializeNBTItem(item);
+
+        String insertSql = "INSERT INTO auctions (id, seller_uuid, item_nbt, start_price, current_bid, end_time, status) VALUES (?, ?, ?, ?, ?, ?, ?);";
+        databaseManager.executeUpdate(insertSql,
+                auctionId.toString(), player.getUniqueId().toString(), itemNBT, price, price, endTime, AuctionItem.AuctionStatus.ACTIVE.name()
+        ).thenAccept(rows -> {
+            if (rows > 0) {
+                AuctionItem auctionItem = new AuctionItem(auctionId, player.getUniqueId(), item, price, price, null, endTime, AuctionItem.AuctionStatus.ACTIVE);
+                activeAuctions.put(auctionId, auctionItem);
+                player.getInventory().removeItem(item);
+                player.sendMessage("§aYour item has been listed for auction! ID: §e" + auctionId + "§a. Starting bid: §e" + economy.format(price));
             } else {
-                player.sendMessage(ChatColor.YELLOW + "You have no money in your auction escrow to withdraw.");
+                player.sendMessage("§cFailed to list item for auction.");
             }
-            return amount;
+        }).exceptionally(ex -> {
+            player.sendMessage("§cAn error occurred while creating the auction.");
+            plugin.getLogger().severe("Error creating auction: " + ex.getMessage());
+            return null;
         });
     }
 
-    public CompletableFuture<Double> getPlayerEscrowBalance(Player player) {
-        return databaseManager.getEscrowBalance(player.getUniqueId().toString()).thenApply(balance -> {
-            player.sendMessage(ChatColor.YELLOW + "Your current escrow balance is: " + economy.format(balance));
-            return balance;
+    public void placeBid(Player player, UUID auctionId, double bidAmount) {
+        AuctionItem auction = activeAuctions.get(auctionId);
+
+        if (auction == null || auction.getStatus() != AuctionItem.AuctionStatus.ACTIVE) {
+            player.sendMessage("§cAuction not found or not active.");
+            return;
+        }
+        if (auction.getSellerId().equals(player.getUniqueId())) {
+            player.sendMessage("§cYou cannot bid on your own auction.");
+            return;
+        }
+        if (bidAmount <= auction.getCurrentBid()) {
+            player.sendMessage("§cYour bid must be higher than the current bid (which is " + economy.format(auction.getCurrentBid()) + ").");
+            return;
+        }
+        if (!economy.has(player, bidAmount)) {
+            player.sendMessage("§cYou do not have enough money to place that bid.");
+            return;
+        }
+
+        // Asynchronously handle the bidding logic including escrow
+        CompletableFuture.runAsync(() -> {
+            // First, return previous bidder's money
+            if (auction.getCurrentBidderId() != null) {
+                OfflinePlayer previousBidder = Bukkit.getOfflinePlayer(auction.getCurrentBidderId());
+                economy.depositPlayer(previousBidder, auction.getCurrentBid());
+                if (previousBidder.isOnline()) {
+                    previousBidder.getPlayer().sendMessage("§aYour previous bid of " + economy.format(auction.getCurrentBid()) + " has been returned.");
+                }
+            }
+
+            // Deduct new bid from current player and update auction
+            economy.withdrawPlayer(player, bidAmount);
+
+            String updateSql = "UPDATE auctions SET current_bid = ?, current_bidder_uuid = ? WHERE id = ? AND current_bid < ?;";
+            databaseManager.executeUpdate(updateSql,
+                    bidAmount, player.getUniqueId().toString(), auctionId.toString(), bidAmount // Use bidAmount again to ensure no race condition
+            ).thenAccept(rows -> {
+                if (rows > 0) {
+                    auction.setCurrentBid(bidAmount);
+                    auction.setCurrentBidderId(player.getUniqueId());
+                    player.sendMessage("§aYou have successfully bid " + economy.format(bidAmount) + " on auction ID: §e" + auctionId);
+                    Bukkit.broadcastMessage("§e" + player.getName() + " §ahas bid " + economy.format(bidAmount) + " on an item!");
+                } else {
+                    // This can happen if another player outbid in between the check and update.
+                    // Return the money to the player and notify.
+                    economy.depositPlayer(player, bidAmount);
+                    player.sendMessage("§cYour bid was too low or another player outbid you. Please check the current bid again.");
+                }
+            }).exceptionally(ex -> {
+                player.sendMessage("§cAn error occurred while placing your bid.");
+                plugin.getLogger().severe("Error placing bid: " + ex.getMessage());
+                economy.depositPlayer(player, bidAmount); // Refund if database error
+                return null;
+            });
+        }, plugin.getServer().getScheduler().asyncScheduler());
+    }
+
+    public void claimItems(Player player) {
+        long currentTime = Instant.now().getEpochSecond();
+        String selectSql = "SELECT id, item_nbt, current_bid, seller_uuid, current_bidder_uuid FROM auctions WHERE (seller_uuid = ? AND (status IN ('PENDING_CLAIM_SELLER_ITEM', 'EXPIRED_NO_BIDS') OR (status = 'ACTIVE' AND end_time <= ?))) OR (current_bidder_uuid = ? AND status = 'PENDING_CLAIM_BIDDER_ITEM');";
+        databaseManager.executeQuery(selectSql, rs -> {
+            try {
+                int claimedCount = 0;
+                while (rs.next()) {
+                    UUID auctionId = UUID.fromString(rs.getString("id"));
+                    UUID sellerId = UUID.fromString(rs.getString("seller_uuid"));
+                    UUID bidderId = null;
+                    if (rs.getString("current_bidder_uuid") != null) {
+                         bidderId = UUID.fromString(rs.getString("current_bidder_uuid"));
+                    }
+                    ItemStack item = plugin.getNbtUtils().deserializeNBTItem(rs.getString("item_nbt"));
+                    double currentBid = rs.getDouble("current_bid");
+
+                    if (player.getUniqueId().equals(sellerId)) {
+                        // Seller may claim item or money
+                        if (bidderId != null && currentBid > 0) { // Item was sold
+                            economy.depositPlayer(player, currentBid);
+                            player.sendMessage("§aClaimed §e" + economy.format(currentBid) + " §afrom auction §e" + auctionId + ".");
+                            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
+                        } else { // Item not sold, claim item back
+                            player.getInventory().addItem(item);
+                            player.sendMessage("§aClaimed item " + item.getType().name() + " from auction §e" + auctionId + ".");
+                            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
+                        }
+                        claimedCount++;
+                    } else if (player.getUniqueId().equals(bidderId)) {
+                        // Bidder may claim item
+                        player.getInventory().addItem(item);
+                        player.sendMessage("§aClaimed item " + item.getType().name() + " from auction §e" + auctionId + ".");
+                        updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
+                        claimedCount++;
+                    }
+                }
+                if (claimedCount == 0) {
+                    player.sendMessage("§cYou have no items or money to claim from auctions.");
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Error claiming items for player " + player.getName() + ": " + e.getMessage());
+                player.sendMessage("§cAn error occurred while claiming your items.");
+            }
+        }, player.getUniqueId().toString(), currentTime, player.getUniqueId().toString());
+    }
+
+    public void cancelAuction(Player player, UUID auctionId) {
+        AuctionItem auction = activeAuctions.get(auctionId);
+        if (auction == null) {
+            player.sendMessage("§cAuction not found.");
+            return;
+        }
+        if (!auction.getSellerId().equals(player.getUniqueId())) {
+            player.sendMessage("§cYou can only cancel your own auctions.");
+            return;
+        }
+        if (auction.getCurrentBidderId() != null) {
+            player.sendMessage("§cYou cannot cancel an auction that already has bids.");
+            return;
+        }
+
+        String updateSql = "UPDATE auctions SET status = 'CANCELLED' WHERE id = ?;";
+        databaseManager.executeUpdate(updateSql, auctionId.toString()).thenAccept(rows -> {
+            if (rows > 0) {
+                activeAuctions.remove(auctionId);
+                player.getInventory().addItem(auction.getItem());
+                player.sendMessage("§aAuction §e" + auctionId + " §ahas been cancelled and your item returned.");
+            } else {
+                player.sendMessage("§cFailed to cancel auction.");
+            }
+        }).exceptionally(ex -> {
+            player.sendMessage("§cAn error occurred while cancelling the auction.");
+            plugin.getLogger().severe("Error cancelling auction: " + ex.getMessage());
+            return null;
         });
     }
 
+    public void sendAuctionList(Player player) {
+        if (activeAuctions.isEmpty()) {
+            player.sendMessage("§eThere are currently no active auctions.");
+            return;
+        }
+
+        player.sendMessage("§b--- Active Auctions ---");
+        activeAuctions.values().stream()
+                .filter(a -> a.getStatus() == AuctionItem.AuctionStatus.ACTIVE)
+                .forEach(auction -> {
+                    OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
+                    String itemName = ItemSerializer.getItemName(auction.getItem());
+                    String bidderInfo = auction.getCurrentBidderId() != null ? " / Bidder: " + Bukkit.getOfflinePlayer(auction.getCurrentBidderId()).getName() : "";
+                    player.sendMessage("§fID: §e" + auction.getId().toString().substring(0, 8) + "... §f| Item: §a" + itemName + " §f| Seller: §b" + seller.getName() + " §f| Current Bid: §6" + economy.format(auction.getCurrentBid()) + bidderInfo);
+                });
+        player.sendMessage("§b-----------------------");
+    }
+
+    public void expireAuction(UUID auctionId) {
+        AuctionItem auction = activeAuctions.get(auctionId);
+        if (auction == null || auction.getStatus() != AuctionItem.AuctionStatus.ACTIVE) return;
+
+        plugin.getLogger().info("Expiring auction: " + auctionId);
+
+        if (auction.getCurrentBidderId() != null) {
+            // Auction sold, transfer money to seller, item to buyer
+            OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
+            OfflinePlayer bidder = Bukkit.getOfflinePlayer(auction.getCurrentBidderId());
+
+            economy.depositPlayer(seller, auction.getCurrentBid());
+            if (seller.isOnline()) {
+                seller.getPlayer().sendMessage("§aYour auction §e" + auctionId + " §ahas sold for " + economy.format(auction.getCurrentBid()) + ". Money has been deposited.");
+            }
+            if (bidder.isOnline()) {
+                bidder.getPlayer().sendMessage("§aYou won auction §e" + auctionId + "! Claim your item with /auction claim.");
+            }
+            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.PENDING_CLAIM_BIDDER_ITEM);
+        } else {
+            // No bids, return item to seller
+            OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
+            if (seller.isOnline()) {
+                seller.getPlayer().sendMessage("§cYour auction §e" + auctionId + " §ahad no bids. Claim your item with /auction claim.");
+            }
+            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.EXPIRED_NO_BIDS);
+        }
+        activeAuctions.remove(auctionId);
+    }
+
+    public void expireOldAuctionsForPlayer(Player player) {
+        long currentTime = Instant.now().getEpochSecond();
+        activeAuctions.values().stream()
+                .filter(a -> a.getStatus() == AuctionItem.AuctionStatus.ACTIVE && a.getEndTime() <= currentTime)
+                .filter(a -> a.getSellerId().equals(player.getUniqueId()) || (a.getCurrentBidderId() != null && a.getCurrentBidderId().equals(player.getUniqueId())))
+                .collect(Collectors.toList()) // Collect to avoid ConcurrentModificationException
+                .forEach(auction -> expireAuction(auction.getId()));
+    }
+
+    public void sendPendingClaimsNotification(Player player) {
+        long currentTime = Instant.now().getEpochSecond();
+        String checkSql = "SELECT COUNT(id) FROM auctions WHERE (seller_uuid = ? AND status IN ('PENDING_CLAIM_SELLER_ITEM', 'EXPIRED_NO_BIDS')) OR (current_bidder_uuid = ? AND status = 'PENDING_CLAIM_BIDDER_ITEM');";
+        databaseManager.executeQuery(checkSql, rs -> {
+            try {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    player.sendMessage("§eYou have items or money to claim from the auction house! Use §a/auction claim§e.");
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Error checking pending claims for " + player.getName() + ": " + e.getMessage());
+            }
+        }, player.getUniqueId().toString(), player.getUniqueId().toString());
+    }
+
+    private void updateAuctionStatus(UUID auctionId, AuctionItem.AuctionStatus newStatus) {
+        String updateSql = "UPDATE auctions SET status = ? WHERE id = ?;";
+        databaseManager.executeUpdate(updateSql, newStatus.name(), auctionId.toString()).exceptionally(ex -> {
+            plugin.getLogger().severe("Error updating auction status for " + auctionId + " to " + newStatus.name() + ": " + ex.getMessage());
+            return null;
+        });
+    }
 }
