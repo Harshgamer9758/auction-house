@@ -7,43 +7,49 @@ import java.util.UUID;
 public class AuctionItem {
 
     private int id;
-    private UUID sellerUUID;
+    private String sellerName;
+    private UUID sellerUuid;
     private ItemStack itemStack;
-    private double startPrice;
+    private double startingPrice;
     private double currentBid;
-    private UUID highestBidderUUID;
+    private UUID highestBidderUuid;
+    private String highestBidderName;
+    private long startTime;
     private long endTime;
-    private boolean active;
+    private AuctionStatus status;
 
-    public AuctionItem(int id, UUID sellerUUID, ItemStack itemStack, double startPrice, double currentBid, UUID highestBidderUUID, long endTime, boolean active) {
+    public AuctionItem(int id, String sellerName, UUID sellerUuid, ItemStack itemStack, double startingPrice, double currentBid, UUID highestBidderUuid, String highestBidderName, long startTime, long endTime, AuctionStatus status) {
         this.id = id;
-        this.sellerUUID = sellerUUID;
+        this.sellerName = sellerName;
+        this.sellerUuid = sellerUuid;
         this.itemStack = itemStack;
-        this.startPrice = startPrice;
+        this.startingPrice = startingPrice;
         this.currentBid = currentBid;
-        this.highestBidderUUID = highestBidderUUID;
+        this.highestBidderUuid = highestBidderUuid;
+        this.highestBidderName = highestBidderName;
+        this.startTime = startTime;
         this.endTime = endTime;
-        this.active = active;
+        this.status = status;
     }
 
     public int getId() {
         return id;
     }
 
-    public void setId(int id) {
-        this.id = id;
+    public String getSellerName() {
+        return sellerName;
     }
 
-    public UUID getSellerUUID() {
-        return sellerUUID;
+    public UUID getSellerUuid() {
+        return sellerUuid;
     }
 
     public ItemStack getItemStack() {
         return itemStack;
     }
 
-    public double getStartPrice() {
-        return startPrice;
+    public double getStartingPrice() {
+        return startingPrice;
     }
 
     public double getCurrentBid() {
@@ -54,27 +60,42 @@ public class AuctionItem {
         this.currentBid = currentBid;
     }
 
-    public UUID getHighestBidderUUID() {
-        return highestBidderUUID;
+    public UUID getHighestBidderUuid() {
+        return highestBidderUuid;
     }
 
-    public void setHighestBidderUUID(UUID highestBidderUUID) {
-        this.highestBidderUUID = highestBidderUUID;
+    public void setHighestBidderUuid(UUID highestBidderUuid) {
+        this.highestBidderUuid = highestBidderUuid;
+    }
+
+    public String getHighestBidderName() {
+        return highestBidderName;
+    }
+
+    public void setHighestBidderName(String highestBidderName) {
+        this.highestBidderName = highestBidderName;
+    }
+
+    public long getStartTime() {
+        return startTime;
     }
 
     public long getEndTime() {
         return endTime;
     }
 
-    public void setEndTime(long endTime) {
-        this.endTime = endTime;
+    public AuctionStatus getStatus() {
+        return status;
     }
 
-    public boolean isActive() {
-        return active;
+    public void setStatus(AuctionStatus status) {
+        this.status = status;
     }
 
-    public void setActive(boolean active) {
-        this.active = active;
+    public enum AuctionStatus {
+        LISTED,
+        SOLD,
+        EXPIRED,
+        CANCELLED
     }
 }
