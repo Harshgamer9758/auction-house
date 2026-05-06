@@ -1,102 +1,98 @@
 package com.blockmart.auctionhouse.commands;
 
-import com.blockmart.auctionhouse.AuctionHouse;
+import com.blockmart.auctionhouse.AuctionHousePlugin;
 import com.blockmart.auctionhouse.managers.AuctionManager;
-import com.blockmart.auctionhouse.utils.NBTUtils;
-import org.bukkit.Material;
+import com.blockmart.auctionhouse.models.Auction;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
-import org.bukkit.inventory.ItemStack;
 
-import java.util.UUID;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 public class AuctionCommand implements CommandExecutor {
 
-    private final AuctionHouse plugin;
+    private final AuctionHousePlugin plugin;
     private final AuctionManager auctionManager;
-    private final NBTUtils nbtUtils;
 
-    public AuctionCommand(AuctionHouse plugin, AuctionManager auctionManager, NBTUtils nbtUtils) {
+    public AuctionCommand(AuctionHousePlugin plugin, AuctionManager auctionManager) {
         this.plugin = plugin;
         this.auctionManager = auctionManager;
-        this.nbtUtils = nbtUtils;
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!(sender instanceof Player player)) {
-            sender.sendMessage("§cOnly players can use this command.");
+            sender.sendMessage("Only players can use this command.");
             return true;
         }
 
-        if (args.length == 0) {
-            player.sendMessage("§eUsage: /auction [list|sell <price>|bid <id> <amount>|claim|cancel <id>]");
+        if (!player.hasPermission("auctionhouse.use")) {
+            player.sendMessage(plugin.getConfig().getString("messages.no-permission"));
             return true;
         }
 
-        switch (args[0].toLowerCase()) {
-            case "list":
-                auctionManager.sendAuctionList(player);
-                break;
-            case "sell":
-                if (args.length < 2) {
-                    player.sendMessage("§eUsage: /auction sell <price>");
-                    return true;
+        if (args.length == 0 || args[0].equalsIgnoreCase("list")) {
+            List<Auction> auctions = auctionManager.getActiveAuctions();
+            if (auctions.isEmpty()) {
+                player.sendMessage(plugin.getConfig().getString("messages.no-active-auctions"));
+                return true;
+            }
+
+            player.sendMessage(plugin.getConfig().getString("messages.auction-list-header"));
+            for (Auction auction : auctions) {
+                long timeLeft = auction.getEndTime() - System.currentTimeMillis();
+                String timeLeftFormatted;
+                if (timeLeft <= 0) {
+                    timeLeftFormatted = "Ending soon";
+                } else {
+                    long minutes = TimeUnit.MILLISECONDS.toMinutes(timeLeft);
+                    long seconds = TimeUnit.MILLISECONDS.toSeconds(timeLeft) - TimeUnit.MINUTES.toSeconds(minutes);
+                    timeLeftFormatted = String.format("%d min %d sec", minutes, seconds);
                 }
-                try {
-                    double price = Double.parseDouble(args[1]);
-                    if (price <= 0) {
-                        player.sendMessage("§cPrice must be positive.");
-                        return true;
+
+                player.sendMessage(plugin.getConfig().getString("messages.auction-list-entry")
+                        .replace("%id%", String.valueOf(auction.getId()))
+                        .replace("%item%", auction.getItemStack().getItemMeta().hasDisplayName() ? auction.getItemStack().getItemMeta().getDisplayName() : auction.getItemStack().getType().name())
+                        .replace("%seller%", auction.getSellerName())
+                        .replace("%bid%", String.format("%.2f", auction.getCurrentBid()))
+                        .replace("%time_left%", timeLeftFormatted)
+                );
+            }
+            return true;
+        } else if (args[0].equalsIgnoreCase("collect")) {
+            // Implement escrow collection logic
+            auctionManager.getPlayerEscrow(player.getUniqueId()).thenAccept(escrows -> {
+                if (escrows.isEmpty()) {
+                    player.sendMessage(plugin.getConfig().getString("messages.no-escrow-items"));
+                    return;
+                }
+                player.sendMessage(plugin.getConfig().getString("messages.escrow-collect-header"));
+                for (Escrow escrow : escrows) {
+                    if (escrow.getItemStack() != null) {
+                        if (player.getInventory().addItem(escrow.getItemStack()).isEmpty()) {
+                            auctionManager.claimFromEscrow(escrow.getId());
+                            player.sendMessage(plugin.getConfig().getString("messages.escrow-item-collected")
+                                    .replace("%item%", escrow.getItemStack().getItemMeta().hasDisplayName() ? escrow.getItemStack().getItemMeta().getDisplayName() : escrow.getItemStack().getType().name()));
+                        } else {
+                            player.sendMessage(plugin.getConfig().getString("messages.escrow-inventory-full"));
+                        }
+                    } else if (escrow.getAmount() > 0) {
+                        if (plugin.getVaultHook().deposit(player.getUniqueId(), escrow.getAmount())) {
+                            auctionManager.claimFromEscrow(escrow.getId());
+                            player.sendMessage(plugin.getConfig().getString("messages.escrow-money-collected")
+                                    .replace("%amount%", String.format("%.2f", escrow.getAmount())));
+                        } else {
+                            player.sendMessage(plugin.getConfig().getString("messages.escrow-money-failed"));
+                        }
                     }
-                    ItemStack handItem = player.getInventory().getItemInMainHand();
-                    if (handItem.getType() == Material.AIR) {
-                        player.sendMessage("§cYou must hold an item to sell.");
-                        return true;
-                    }
-                    auctionManager.createAuction(player, handItem, price);
-                } catch (NumberFormatException e) {
-                    player.sendMessage("§cInvalid price.");
                 }
-                break;
-            case "bid":
-                if (args.length < 3) {
-                    player.sendMessage("§eUsage: /auction bid <id> <amount>");
-                    return true;
-                }
-                try {
-                    UUID auctionId = UUID.fromString(args[1]);
-                    double bidAmount = Double.parseDouble(args[2]);
-                    if (bidAmount <= 0) {
-                        player.sendMessage("§cBid amount must be positive.");
-                        return true;
-                    }
-                    auctionManager.placeBid(player, auctionId, bidAmount);
-                } catch (IllegalArgumentException e) {
-                    player.sendMessage("§cInvalid auction ID or bid amount.");
-                }
-                break;
-            case "claim":
-                auctionManager.claimItems(player);
-                break;
-            case "cancel":
-                if (args.length < 2) {
-                    player.sendMessage("§eUsage: /auction cancel <id>");
-                    return true;
-                }
-                try {
-                    UUID auctionId = UUID.fromString(args[1]);
-                    auctionManager.cancelAuction(player, auctionId);
-                } catch (IllegalArgumentException e) {
-                    player.sendMessage("§cInvalid auction ID.");
-                }
-                break;
-            default:
-                player.sendMessage("§eUsage: /auction [list|sell <price>|bid <id> <amount>|claim|cancel <id>]");
-                break;
+            });
+            return true;
         }
+
+        player.sendMessage(plugin.getConfig().getString("messages.invalid-command-usage").replace("%command%", label));
         return true;
     }
 }

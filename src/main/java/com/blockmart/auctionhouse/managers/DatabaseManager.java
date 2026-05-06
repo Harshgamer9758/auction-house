@@ -1,104 +1,103 @@
 package com.blockmart.auctionhouse.managers;
 
-import com.blockmart.auctionhouse.AuctionHouse;
+import com.blockmart.auctionhouse.AuctionHousePlugin;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import org.bukkit.Bukkit;
+import org.bukkit.scheduler.BukkitRunnable;
 
-import java.io.File;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
 
 public class DatabaseManager {
 
-    private final AuctionHouse plugin;
-    private final String databasePath;
+    private final AuctionHousePlugin plugin;
     private HikariDataSource dataSource;
 
-    public DatabaseManager(AuctionHouse plugin, String databasePath) {
+    public DatabaseManager(AuctionHousePlugin plugin) {
         this.plugin = plugin;
-        this.databasePath = databasePath;
+        initDatabase();
     }
 
-    public void loadDatabase() {
+    private void initDatabase() {
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl("jdbc:sqlite:" + databasePath);
-        config.setPoolName("AuctionHouseHikari");
-        config.setMaxLifetime(60000);
-        config.setIdleTimeout(30000);
+        config.setJdbcUrl("jdbc:sqlite:" + plugin.getDataFolder().getAbsolutePath() + "/auctionhouse.db");
         config.setMaximumPoolSize(10);
+        config.setConnectionTestQuery("SELECT 1");
+        config.addDataSourceProperty("cachePrepStmts", "true");
+        config.addDataSourceProperty("prepStmtCacheSize", "250");
+        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        config.addDataSourceProperty("journal_mode", "WAL");
+        this.dataSource = new HikariDataSource(config);
 
-        File dbFile = new File(databasePath);
-        if (!dbFile.exists()) {
-            dbFile.getParentFile().mkdirs();
-        }
-
-        try {
-            dataSource = new HikariDataSource(config);
-            createTables();
-            plugin.getLogger().info("SQLite database connected and tables checked/created.");
-        } catch (SQLException e) {
-            plugin.getLogger().severe("Failed to connect to SQLite database: " + e.getMessage());
-        }
+        createTables();
     }
 
-    private void createTables() throws SQLException {
-        String sql = "CREATE TABLE IF NOT EXISTS auctions (" +
-                     "id VARCHAR(36) PRIMARY KEY," +
-                     "seller_uuid VARCHAR(36) NOT NULL," +
-                     "item_nbt TEXT NOT NULL," +
-                     "start_price DOUBLE NOT NULL," +
-                     "current_bid DOUBLE NOT NULL," +
-                     "current_bidder_uuid VARCHAR(36)," +
-                     "end_time BIGINT NOT NULL," +
-                     "status VARCHAR(50) NOT NULL" +
-                     ");";
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute(sql);
-        }
-    }
+    private void createTables() {
+        final String CREATE_AUCTIONS_TABLE = "CREATE TABLE IF NOT EXISTS auctions (" +
+                "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                "sellerUUID VARCHAR(36) NOT NULL," +
+                "sellerName VARCHAR(16) NOT NULL," +
+                "itemStack TEXT NOT NULL," +
+                "startPrice DOUBLE NOT NULL," +
+                "currentBid DOUBLE NOT NULL," +
+                "highestBidderUUID VARCHAR(36)," +
+                "highestBidderName VARCHAR(16)," +
+                "endTime INTEGER NOT NULL," +
+                "status VARCHAR(20) NOT NULL);";
 
-    public CompletableFuture<Integer> executeUpdate(String sql, Object... params) {
-        return CompletableFuture.supplyAsync(() -> {
+        final String CREATE_ESCROWS_TABLE = "CREATE TABLE IF NOT EXISTS escrows (" +
+                "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                "ownerUUID VARCHAR(36) NOT NULL," +
+                "itemStack TEXT,"
+                + "amount DOUBLE NOT NULL DEFAULT 0.0);";
+
+        CompletableFuture.runAsync(() -> {
             try (Connection conn = dataSource.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(sql)) {
-                for (int i = 0; i < params.length; i++) {
-                    stmt.setObject(i + 1, params[i]);
-                }
-                return stmt.executeUpdate();
+                 PreparedStatement stmt1 = conn.prepareStatement(CREATE_AUCTIONS_TABLE);
+                 PreparedStatement stmt2 = conn.prepareStatement(CREATE_ESCROWS_TABLE)) {
+                stmt1.execute();
+                stmt2.execute();
+                plugin.getLogger().info("Database tables created or verified.");
             } catch (SQLException e) {
-                plugin.getLogger().severe("Database update error for query: " + sql + ", Error: " + e.getMessage());
-                throw new RuntimeException(e);
+                plugin.getLogger().severe("Could not create database tables: " + e.getMessage());
             }
-        }, plugin.getServer().getScheduler().asyncScheduler());
+        });
     }
 
-    public CompletableFuture<Void> executeQuery(String sql, Consumer<ResultSet> consumer, Object... params) {
+    public CompletableFuture<Void> executeUpdate(String sql, Object... params) {
         return CompletableFuture.runAsync(() -> {
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement stmt = conn.prepareStatement(sql)) {
                 for (int i = 0; i < params.length; i++) {
                     stmt.setObject(i + 1, params[i]);
                 }
-                try (ResultSet rs = stmt.executeQuery()) {
-                    consumer.accept(rs);
-                }
+                stmt.executeUpdate();
             } catch (SQLException e) {
-                plugin.getLogger().severe("Database query error for query: " + sql + ", Error: " + e.getMessage());
-                throw new RuntimeException(e);
+                plugin.getLogger().severe("Database update error: " + e.getMessage());
             }
-        }, plugin.getServer().getScheduler().asyncScheduler());
+        }, Bukkit.getScheduler().getCurrentWorkerThread() == null ? new BukkitRunnable() {
+            @Override
+            public void run() {}
+        }.runTaskAsynchronously(plugin).getScheduler().getAsyncRunner() : Runnable::run);
     }
 
-    public void closeConnection() {
+    public CompletableFuture<Connection> getConnectionAsync() {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return dataSource.getConnection();
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to get database connection: " + e.getMessage());
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    public void closePool() {
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
-            plugin.getLogger().info("SQLite database connection closed.");
         }
     }
 }

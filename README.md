@@ -1,6 +1,6 @@
 # AuctionHouse
 
-A feature-rich auction house plugin with escrow and bidding.
+A feature-rich auction house with escrow and bidding functionalities.
 
 ## Build
 

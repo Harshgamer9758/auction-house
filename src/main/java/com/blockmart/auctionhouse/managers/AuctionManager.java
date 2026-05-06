@@ -1,316 +1,291 @@
 package com.blockmart.auctionhouse.managers;
 
-import com.blockmart.auctionhouse.AuctionHouse;
-import com.blockmart.auctionhouse.models.AuctionItem;
-import com.blockmart.auctionhouse.utils.ItemSerializer;
-import com.blockmart.auctionhouse.utils.NBTUtils;
-import net.milkbowl.vault.economy.Economy;
+import com.blockmart.auctionhouse.AuctionHousePlugin;
+import com.blockmart.auctionhouse.models.Auction;
+import com.blockmart.auctionhouse.models.AuctionStatus;
+import com.blockmart.auctionhouse.models.Escrow;
+import com.blockmart.auctionhouse.utils.NBTUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
-import org.bukkit.entity.Player;
+import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.scheduler.BukkitRunnable;
 
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class AuctionManager {
 
-    private final AuctionHouse plugin;
+    private final AuctionHousePlugin plugin;
     private final DatabaseManager databaseManager;
-    private final Economy economy;
-    private final Map<UUID, AuctionItem> activeAuctions;
-    private final long AUCTION_DURATION_SECONDS = 24 * 60 * 60; // 24 hours
+    private final ConcurrentHashMap<Integer, Auction> activeAuctions;
 
-    public AuctionManager(AuctionHouse plugin, DatabaseManager databaseManager, Economy economy) {
+    public AuctionManager(AuctionHousePlugin plugin, DatabaseManager databaseManager) {
         this.plugin = plugin;
         this.databaseManager = databaseManager;
-        this.economy = economy;
         this.activeAuctions = new ConcurrentHashMap<>();
+        startAuctionCleanupTask();
     }
 
-    public CompletableFuture<Void> loadActiveAuctions() {
-        return CompletableFuture.runAsync(() -> {
-            long currentTime = Instant.now().getEpochSecond();
-            String query = "SELECT id, seller_uuid, item_nbt, start_price, current_bid, current_bidder_uuid, end_time, status FROM auctions WHERE status = 'ACTIVE' OR status = 'PENDING_CLAIM_SELLER_ITEM' OR status = 'PENDING_CLAIM_BIDDER_ITEM';";
-            databaseManager.executeQuery(query, rs -> {
-                try {
-                    while (rs.next()) {
-                        UUID id = UUID.fromString(rs.getString("id"));
-                        UUID sellerId = UUID.fromString(rs.getString("seller_uuid"));
-                        ItemStack item = plugin.getNbtUtils().deserializeNBTItem(rs.getString("item_nbt"));
-                        double startPrice = rs.getDouble("start_price");
-                        double currentBid = rs.getDouble("current_bid");
-                        UUID currentBidderId = null;
-                        if (rs.getString("current_bidder_uuid") != null) {
-                            currentBidderId = UUID.fromString(rs.getString("current_bidder_uuid"));
-                        }
-                        long endTime = rs.getLong("end_time");
-                        AuctionItem.AuctionStatus status = AuctionItem.AuctionStatus.valueOf(rs.getString("status"));
-
-                        AuctionItem auctionItem = new AuctionItem(id, sellerId, item, startPrice, currentBid, currentBidderId, endTime, status);
-                        activeAuctions.put(id, auctionItem);
-                        if (auctionItem.getStatus() == AuctionItem.AuctionStatus.ACTIVE && auctionItem.getEndTime() <= currentTime) {
-                            // This auction should have expired async, but handle it if still active
-                            new BukkitRunnable() {
-                                @Override
-                                public void run() {
-                                    expireAuction(auctionItem.getId());
-                                }
-                            }.runTask(plugin);
-                        }
-                    }
-                    plugin.getLogger().info("Loaded " + activeAuctions.size() + " active auctions.");
-                } catch (SQLException e) {
-                    plugin.getLogger().severe("Failed to load auctions: " + e.getMessage());
-                }
-            });
-        }, plugin.getServer().getScheduler().asyncScheduler());
+    public Optional<Auction> getAuctionById(int id) {
+        return Optional.ofNullable(activeAuctions.get(id));
     }
 
-    public void createAuction(Player player, ItemStack item, double price) {
-        UUID auctionId = UUID.randomUUID();
-        long endTime = Instant.now().getEpochSecond() + AUCTION_DURATION_SECONDS;
-        String itemNBT = plugin.getNbtUtils().serializeNBTItem(item);
-
-        String insertSql = "INSERT INTO auctions (id, seller_uuid, item_nbt, start_price, current_bid, end_time, status) VALUES (?, ?, ?, ?, ?, ?, ?);";
-        databaseManager.executeUpdate(insertSql,
-                auctionId.toString(), player.getUniqueId().toString(), itemNBT, price, price, endTime, AuctionItem.AuctionStatus.ACTIVE.name()
-        ).thenAccept(rows -> {
-            if (rows > 0) {
-                AuctionItem auctionItem = new AuctionItem(auctionId, player.getUniqueId(), item, price, price, null, endTime, AuctionItem.AuctionStatus.ACTIVE);
-                activeAuctions.put(auctionId, auctionItem);
-                player.getInventory().removeItem(item);
-                player.sendMessage("§aYour item has been listed for auction! ID: §e" + auctionId + "§a. Starting bid: §e" + economy.format(price));
-            } else {
-                player.sendMessage("§cFailed to list item for auction.");
-            }
-        }).exceptionally(ex -> {
-            player.sendMessage("§cAn error occurred while creating the auction.");
-            plugin.getLogger().severe("Error creating auction: " + ex.getMessage());
-            return null;
-        });
+    public List<Auction> getActiveAuctions() {
+        return new ArrayList<>(activeAuctions.values());
     }
 
-    public void placeBid(Player player, UUID auctionId, double bidAmount) {
-        AuctionItem auction = activeAuctions.get(auctionId);
-
-        if (auction == null || auction.getStatus() != AuctionItem.AuctionStatus.ACTIVE) {
-            player.sendMessage("§cAuction not found or not active.");
-            return;
-        }
-        if (auction.getSellerId().equals(player.getUniqueId())) {
-            player.sendMessage("§cYou cannot bid on your own auction.");
-            return;
-        }
-        if (bidAmount <= auction.getCurrentBid()) {
-            player.sendMessage("§cYour bid must be higher than the current bid (which is " + economy.format(auction.getCurrentBid()) + ").");
-            return;
-        }
-        if (!economy.has(player, bidAmount)) {
-            player.sendMessage("§cYou do not have enough money to place that bid.");
-            return;
-        }
-
-        // Asynchronously handle the bidding logic including escrow
-        CompletableFuture.runAsync(() -> {
-            // First, return previous bidder's money
-            if (auction.getCurrentBidderId() != null) {
-                OfflinePlayer previousBidder = Bukkit.getOfflinePlayer(auction.getCurrentBidderId());
-                economy.depositPlayer(previousBidder, auction.getCurrentBid());
-                if (previousBidder.isOnline()) {
-                    previousBidder.getPlayer().sendMessage("§aYour previous bid of " + economy.format(auction.getCurrentBid()) + " has been returned.");
-                }
-            }
-
-            // Deduct new bid from current player and update auction
-            economy.withdrawPlayer(player, bidAmount);
-
-            String updateSql = "UPDATE auctions SET current_bid = ?, current_bidder_uuid = ? WHERE id = ? AND current_bid < ?;";
-            databaseManager.executeUpdate(updateSql,
-                    bidAmount, player.getUniqueId().toString(), auctionId.toString(), bidAmount // Use bidAmount again to ensure no race condition
-            ).thenAccept(rows -> {
-                if (rows > 0) {
-                    auction.setCurrentBid(bidAmount);
-                    auction.setCurrentBidderId(player.getUniqueId());
-                    player.sendMessage("§aYou have successfully bid " + economy.format(bidAmount) + " on auction ID: §e" + auctionId);
-                    Bukkit.broadcastMessage("§e" + player.getName() + " §ahas bid " + economy.format(bidAmount) + " on an item!");
-                } else {
-                    // This can happen if another player outbid in between the check and update.
-                    // Return the money to the player and notify.
-                    economy.depositPlayer(player, bidAmount);
-                    player.sendMessage("§cYour bid was too low or another player outbid you. Please check the current bid again.");
-                }
-            }).exceptionally(ex -> {
-                player.sendMessage("§cAn error occurred while placing your bid.");
-                plugin.getLogger().severe("Error placing bid: " + ex.getMessage());
-                economy.depositPlayer(player, bidAmount); // Refund if database error
-                return null;
-            });
-        }, plugin.getServer().getScheduler().asyncScheduler());
-    }
-
-    public void claimItems(Player player) {
-        long currentTime = Instant.now().getEpochSecond();
-        String selectSql = "SELECT id, item_nbt, current_bid, seller_uuid, current_bidder_uuid FROM auctions WHERE (seller_uuid = ? AND (status IN ('PENDING_CLAIM_SELLER_ITEM', 'EXPIRED_NO_BIDS') OR (status = 'ACTIVE' AND end_time <= ?))) OR (current_bidder_uuid = ? AND status = 'PENDING_CLAIM_BIDDER_ITEM');";
-        databaseManager.executeQuery(selectSql, rs -> {
-            try {
-                int claimedCount = 0;
+    public void loadAllAuctions() {
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, sellerUUID, sellerName, itemStack, startPrice, currentBid, highestBidderUUID, highestBidderName, endTime, status FROM auctions WHERE status = ? OR status = ?")) {
+                ps.setString(1, AuctionStatus.ACTIVE.name());
+                ps.setString(2, AuctionStatus.ENDING.name());
+                ResultSet rs = ps.executeQuery();
                 while (rs.next()) {
-                    UUID auctionId = UUID.fromString(rs.getString("id"));
-                    UUID sellerId = UUID.fromString(rs.getString("seller_uuid"));
-                    UUID bidderId = null;
-                    if (rs.getString("current_bidder_uuid") != null) {
-                         bidderId = UUID.fromString(rs.getString("current_bidder_uuid"));
+                    try {
+                        ItemStack itemStack = NBTUtil.itemStackFromBase64(rs.getString("itemStack"));
+                        Auction auction = new Auction(
+                                rs.getInt("id"),
+                                UUID.fromString(rs.getString("sellerUUID")),
+                                rs.getString("sellerName"),
+                                itemStack,
+                                rs.getDouble("startPrice"),
+                                rs.getDouble("currentBid"),
+                                rs.getString("highestBidderUUID") != null ? UUID.fromString(rs.getString("highestBidderUUID")) : null,
+                                rs.getString("highestBidderName"),
+                                rs.getLong("endTime"),
+                                AuctionStatus.valueOf(rs.getString("status"))
+                        );
+                        activeAuctions.put(auction.getId(), auction);
+                    } catch (IOException | InvalidConfigurationException e) {
+                        plugin.getLogger().warning("Failed to deserialize item for auction ID " + rs.getInt("id") + ": " + e.getMessage());
                     }
-                    ItemStack item = plugin.getNbtUtils().deserializeNBTItem(rs.getString("item_nbt"));
-                    double currentBid = rs.getDouble("current_bid");
-
-                    if (player.getUniqueId().equals(sellerId)) {
-                        // Seller may claim item or money
-                        if (bidderId != null && currentBid > 0) { // Item was sold
-                            economy.depositPlayer(player, currentBid);
-                            player.sendMessage("§aClaimed §e" + economy.format(currentBid) + " §afrom auction §e" + auctionId + ".");
-                            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
-                        } else { // Item not sold, claim item back
-                            player.getInventory().addItem(item);
-                            player.sendMessage("§aClaimed item " + item.getType().name() + " from auction §e" + auctionId + ".");
-                            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
-                        }
-                        claimedCount++;
-                    } else if (player.getUniqueId().equals(bidderId)) {
-                        // Bidder may claim item
-                        player.getInventory().addItem(item);
-                        player.sendMessage("§aClaimed item " + item.getType().name() + " from auction §e" + auctionId + ".");
-                        updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.COMPLETED);
-                        claimedCount++;
-                    }
-                }
-                if (claimedCount == 0) {
-                    player.sendMessage("§cYou have no items or money to claim from auctions.");
                 }
             } catch (SQLException e) {
-                plugin.getLogger().severe("Error claiming items for player " + player.getName() + ": " + e.getMessage());
-                player.sendMessage("§cAn error occurred while claiming your items.");
+                plugin.getLogger().severe("Failed to load auctions: " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
             }
-        }, player.getUniqueId().toString(), currentTime, player.getUniqueId().toString());
-    }
-
-    public void cancelAuction(Player player, UUID auctionId) {
-        AuctionItem auction = activeAuctions.get(auctionId);
-        if (auction == null) {
-            player.sendMessage("§cAuction not found.");
-            return;
-        }
-        if (!auction.getSellerId().equals(player.getUniqueId())) {
-            player.sendMessage("§cYou can only cancel your own auctions.");
-            return;
-        }
-        if (auction.getCurrentBidderId() != null) {
-            player.sendMessage("§cYou cannot cancel an auction that already has bids.");
-            return;
-        }
-
-        String updateSql = "UPDATE auctions SET status = 'CANCELLED' WHERE id = ?;";
-        databaseManager.executeUpdate(updateSql, auctionId.toString()).thenAccept(rows -> {
-            if (rows > 0) {
-                activeAuctions.remove(auctionId);
-                player.getInventory().addItem(auction.getItem());
-                player.sendMessage("§aAuction §e" + auctionId + " §ahas been cancelled and your item returned.");
-            } else {
-                player.sendMessage("§cFailed to cancel auction.");
-            }
-        }).exceptionally(ex -> {
-            player.sendMessage("§cAn error occurred while cancelling the auction.");
-            plugin.getLogger().severe("Error cancelling auction: " + ex.getMessage());
-            return null;
         });
     }
 
-    public void sendAuctionList(Player player) {
-        if (activeAuctions.isEmpty()) {
-            player.sendMessage("§eThere are currently no active auctions.");
+    public void createAuction(UUID sellerUUID, String sellerName, ItemStack itemStack, double price, long durationMinutes) {
+        long endTime = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(durationMinutes);
+        String itemStackBase64 = NBTUtil.itemStackToBase64(itemStack);
+
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO auctions (sellerUUID, sellerName, itemStack, startPrice, currentBid, endTime, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    PreparedStatement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, sellerUUID.toString());
+                ps.setString(2, sellerName);
+                ps.setString(3, itemStackBase64);
+                ps.setDouble(4, price);
+                ps.setDouble(5, price);
+                ps.setLong(6, endTime);
+                ps.setString(7, AuctionStatus.ACTIVE.name());
+                ps.executeUpdate();
+
+                ResultSet rs = ps.getGeneratedKeys();
+                if (rs.next()) {
+                    int auctionId = rs.getInt(1);
+                    Auction auction = new Auction(auctionId, sellerUUID, sellerName, itemStack, price, price, null, null, endTime, AuctionStatus.ACTIVE);
+                    activeAuctions.put(auctionId, auction);
+                    plugin.getLogger().info("Created new auction: " + auctionId);
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to create auction: " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
+        });
+    }
+
+    public void bidOnAuction(Auction auction, UUID bidderUUID, String bidderName, double bidAmount) {
+        if (!activeAuctions.containsKey(auction.getId())) {
+            // Auction might have just ended or been removed
             return;
         }
 
-        player.sendMessage("§b--- Active Auctions ---");
-        activeAuctions.values().stream()
-                .filter(a -> a.getStatus() == AuctionItem.AuctionStatus.ACTIVE)
-                .forEach(auction -> {
-                    OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
-                    String itemName = ItemSerializer.getItemName(auction.getItem());
-                    String bidderInfo = auction.getCurrentBidderId() != null ? " / Bidder: " + Bukkit.getOfflinePlayer(auction.getCurrentBidderId()).getName() : "";
-                    player.sendMessage("§fID: §e" + auction.getId().toString().substring(0, 8) + "... §f| Item: §a" + itemName + " §f| Seller: §b" + seller.getName() + " §f| Current Bid: §6" + economy.format(auction.getCurrentBid()) + bidderInfo);
-                });
-        player.sendMessage("§b-----------------------");
-    }
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE auctions SET currentBid = ?, highestBidderUUID = ?, highestBidderName = ? WHERE id = ?")) {
+                ps.setDouble(1, bidAmount);
+                ps.setString(2, bidderUUID.toString());
+                ps.setString(3, bidderName);
+                ps.setInt(4, auction.getId());
+                ps.executeUpdate();
 
-    public void expireAuction(UUID auctionId) {
-        AuctionItem auction = activeAuctions.get(auctionId);
-        if (auction == null || auction.getStatus() != AuctionItem.AuctionStatus.ACTIVE) return;
-
-        plugin.getLogger().info("Expiring auction: " + auctionId);
-
-        if (auction.getCurrentBidderId() != null) {
-            // Auction sold, transfer money to seller, item to buyer
-            OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
-            OfflinePlayer bidder = Bukkit.getOfflinePlayer(auction.getCurrentBidderId());
-
-            economy.depositPlayer(seller, auction.getCurrentBid());
-            if (seller.isOnline()) {
-                seller.getPlayer().sendMessage("§aYour auction §e" + auctionId + " §ahas sold for " + economy.format(auction.getCurrentBid()) + ". Money has been deposited.");
-            }
-            if (bidder.isOnline()) {
-                bidder.getPlayer().sendMessage("§aYou won auction §e" + auctionId + "! Claim your item with /auction claim.");
-            }
-            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.PENDING_CLAIM_BIDDER_ITEM);
-        } else {
-            // No bids, return item to seller
-            OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerId());
-            if (seller.isOnline()) {
-                seller.getPlayer().sendMessage("§cYour auction §e" + auctionId + " §ahad no bids. Claim your item with /auction claim.");
-            }
-            updateAuctionStatus(auctionId, AuctionItem.AuctionStatus.EXPIRED_NO_BIDS);
-        }
-        activeAuctions.remove(auctionId);
-    }
-
-    public void expireOldAuctionsForPlayer(Player player) {
-        long currentTime = Instant.now().getEpochSecond();
-        activeAuctions.values().stream()
-                .filter(a -> a.getStatus() == AuctionItem.AuctionStatus.ACTIVE && a.getEndTime() <= currentTime)
-                .filter(a -> a.getSellerId().equals(player.getUniqueId()) || (a.getCurrentBidderId() != null && a.getCurrentBidderId().equals(player.getUniqueId())))
-                .collect(Collectors.toList()) // Collect to avoid ConcurrentModificationException
-                .forEach(auction -> expireAuction(auction.getId()));
-    }
-
-    public void sendPendingClaimsNotification(Player player) {
-        long currentTime = Instant.now().getEpochSecond();
-        String checkSql = "SELECT COUNT(id) FROM auctions WHERE (seller_uuid = ? AND status IN ('PENDING_CLAIM_SELLER_ITEM', 'EXPIRED_NO_BIDS')) OR (current_bidder_uuid = ? AND status = 'PENDING_CLAIM_BIDDER_ITEM');";
-        databaseManager.executeQuery(checkSql, rs -> {
-            try {
-                if (rs.next() && rs.getInt(1) > 0) {
-                    player.sendMessage("§eYou have items or money to claim from the auction house! Use §a/auction claim§e.");
+                // Update in-memory object
+                Auction updatedAuction = activeAuctions.get(auction.getId());
+                if (updatedAuction != null) {
+                    updatedAuction.setCurrentBid(bidAmount);
+                    updatedAuction.setHighestBidderUUID(bidderUUID);
+                    updatedAuction.setHighestBidderName(bidderName);
                 }
             } catch (SQLException e) {
-                plugin.getLogger().severe("Error checking pending claims for " + player.getName() + ": " + e.getMessage());
+                plugin.getLogger().severe("Failed to update bid for auction " + auction.getId() + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
             }
-        }, player.getUniqueId().toString(), player.getUniqueId().toString());
+        });
     }
 
-    private void updateAuctionStatus(UUID auctionId, AuctionItem.AuctionStatus newStatus) {
-        String updateSql = "UPDATE auctions SET status = ? WHERE id = ?;";
-        databaseManager.executeUpdate(updateSql, newStatus.name(), auctionId.toString()).exceptionally(ex -> {
-            plugin.getLogger().severe("Error updating auction status for " + auctionId + " to " + newStatus.name() + ": " + ex.getMessage());
-            return null;
+    public void endAuction(Auction auction) {
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE auctions SET status = ? WHERE id = ?")) {
+                ps.setString(1, AuctionStatus.ENDED.name());
+                ps.setInt(2, auction.getId());
+                ps.executeUpdate();
+
+                activeAuctions.remove(auction.getId());
+
+                if (auction.getHighestBidderUUID() != null && auction.getCurrentBid() > auction.getStartPrice()) {
+                    // Auction sold, transfer item to bidder's escrow and money to seller's escrow
+                    addEscrowItem(auction.getHighestBidderUUID(), auction.getItemStack());
+                    addEscrowMoney(auction.getSellerUUID(), auction.getCurrentBid());
+                    Bukkit.getLogger().info("Auction " + auction.getId() + " ended. Item to bidder, money to seller.");
+                    OfflinePlayer bidder = Bukkit.getOfflinePlayer(auction.getHighestBidderUUID());
+                    OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerUUID());
+
+                    if (bidder.isOnline()) {
+                        bidder.getPlayer().sendMessage(plugin.getConfig().getString("messages.auction-won").replace("%item%", auction.getItemStack().getItemMeta().getDisplayName()));
+                    }
+                    if (seller.isOnline()) {
+                        seller.getPlayer().sendMessage(plugin.getConfig().getString("messages.auction-sold").replace("%item%", auction.getItemStack().getItemMeta().getDisplayName()).replace("%amount%", String.valueOf(auction.getCurrentBid())));
+                    }
+                } else {
+                    // No bids or not sold, return item to seller's escrow
+                    addEscrowItem(auction.getSellerUUID(), auction.getItemStack());
+                    plugin.getLogger().info("Auction " + auction.getId() + " ended. Item returned to seller.");
+                    OfflinePlayer seller = Bukkit.getOfflinePlayer(auction.getSellerUUID());
+                    if (seller.isOnline()) {
+                        seller.getPlayer().sendMessage(plugin.getConfig().getString("messages.auction-expired").replace("%item%", auction.getItemStack().getItemMeta().getDisplayName()));
+                    }
+                }
+                // Refund previous highest bidder if a new bid overwrites theirs (escrow logic not fully implemented here but part of the design)
+
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to end auction " + auction.getId() + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
         });
+    }
+
+    public void addEscrowItem(UUID playerUUID, ItemStack item) {
+        String itemBase64 = NBTUtil.itemStackToBase64(item);
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO escrows (ownerUUID, itemStack, amount) VALUES (?, ?, ?)")) {
+                ps.setString(1, playerUUID.toString());
+                ps.setString(2, itemBase64);
+                ps.setDouble(3, 0.0); // Amount is 0 for items
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to add item to escrow for " + playerUUID + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
+        });
+    }
+
+    public void addEscrowMoney(UUID playerUUID, double amount) {
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO escrows (ownerUUID, itemStack, amount) VALUES (?, ?, ?) ON CONFLICT(ownerUUID) DO UPDATE SET amount = amount + EXCLUDED.amount WHERE ownerUUID = EXCLUDED.ownerUUID")) {
+                ps.setString(1, playerUUID.toString());
+                ps.setObject(2, null); // itemStack is null for money
+                ps.setDouble(3, amount);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to add money to escrow for " + playerUUID + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
+        });
+    }
+
+    public List<Escrow> getPlayerEscrow(UUID playerUUID) {
+        List<Escrow> escrows = new ArrayList<>();
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, ownerUUID, itemStack, amount FROM escrows WHERE ownerUUID = ?")) {
+                ps.setString(1, playerUUID.toString());
+                ResultSet rs = ps.executeQuery();
+                while (rs.next()) {
+                    ItemStack item = null;
+                    String itemBase64 = rs.getString("itemStack");
+                    if (itemBase64 != null) {
+                        item = NBTUtil.itemStackFromBase64(itemBase64);
+                    }
+                    escrows.add(new Escrow(
+                            rs.getInt("id"),
+                            UUID.fromString(rs.getString("ownerUUID")),
+                            item,
+                            rs.getDouble("amount")
+                    ));
+                }
+            } catch (SQLException | IOException | InvalidConfigurationException e) {
+                plugin.getLogger().severe("Failed to retrieve escrow for " + playerUUID + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
+        });
+        return escrows;
+    }
+
+    public void claimFromEscrow(int escrowId) {
+        databaseManager.getConnectionAsync().thenAccept(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM escrows WHERE id = ?")) {
+                ps.setInt(1, escrowId);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Failed to claim from escrow ID " + escrowId + ": " + e.getMessage());
+            } finally {
+                try { conn.close(); } catch (SQLException e) { plugin.getLogger().severe("Error closing connection: " + e.getMessage()); }
+            }
+        });
+    }
+
+
+    private void startAuctionCleanupTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                long currentTime = System.currentTimeMillis();
+                List<Auction> endedAuctions = activeAuctions.values().stream()
+                        .filter(auction -> auction.getEndTime() <= currentTime && auction.getStatus() == AuctionStatus.ACTIVE)
+                        .collect(Collectors.toList());
+
+                if (!endedAuctions.isEmpty()) {
+                    plugin.getLogger().info("Processing " + endedAuctions.size() + " ended auctions.");
+                }
+
+                for (Auction auction : endedAuctions) {
+                    auction.setStatus(AuctionStatus.ENDING); // Mark as ending to prevent double processing
+                    endAuction(auction);
+                }
+
+                // Clean up any auctions that might still be marked as ENDING but are already processed.
+                // This part might need more robust handling if `endAuction` can fail repeatedly.
+                activeAuctions.entrySet().removeIf(entry -> entry.getValue().getStatus() == AuctionStatus.ENDED);
+            }
+        }.runTaskTimerAsynchronously(plugin, 20L * 5, 20L * 60); // Every minute
     }
 }
